@@ -1,0 +1,60 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ARG_PORT='${ARG_PORT}'
+# Double-quoted: these values contain a literal "$HOME" that must be expanded
+# by this shell at runtime, not treated as a literal string.
+ARG_MODULE_DIRECTORY="${ARG_MODULE_DIRECTORY}"
+ARG_INSTALL_PREFIX="${ARG_INSTALL_PREFIX}"
+ARG_RESTART_ON_KILL='${ARG_RESTART_ON_KILL}'
+ARG_RESTART_DELAY_SECONDS='${ARG_RESTART_DELAY_SECONDS}'
+ARG_MAX_RESTART_ATTEMPTS='${ARG_MAX_RESTART_ATTEMPTS}'
+ARG_ADDITIONAL_ARGUMENTS=$(echo -n '${ARG_ADDITIONAL_ARGUMENTS}' | base64 -d)
+
+T3_BIN="$${ARG_INSTALL_PREFIX}/node_modules/.bin/t3"
+SCRIPTS_DIR="$${ARG_MODULE_DIRECTORY}/scripts"
+LOG_PATH="$${ARG_MODULE_DIRECTORY}/logs/start.log"
+LAUNCHER_PATH="$${SCRIPTS_DIR}/t3-launcher.sh"
+
+if [ ! -x "$T3_BIN" ]; then
+  echo "❌ t3 binary not found at $T3_BIN. Did the install script run and succeed?"
+  exit 1
+fi
+
+mkdir -p "$SCRIPTS_DIR" "$(dirname "$LOG_PATH")"
+
+# Materialize a standalone launcher so the actual "t3 serve" process is a
+# detached grandchild of this coder_script, not a direct child of it. That
+# lets this script return immediately (required for run_on_start) while the
+# launcher keeps supervising/restarting the server on its own.
+cat > "$LAUNCHER_PATH" << EOF_LAUNCHER
+#!/bin/bash
+restart_attempt=0
+while true; do
+  $(printf '%q' "$T3_BIN") serve --port $(printf '%q' "$${ARG_PORT}") $${ARG_ADDITIONAL_ARGUMENTS}
+  exit_code=\$?
+  ts="\$(date -Iseconds 2> /dev/null || date)"
+  echo "[\$ts] t3 serve exited with code \$exit_code."
+  if [ "$${ARG_RESTART_ON_KILL}" != "true" ]; then
+    break
+  fi
+  if [ "$${ARG_MAX_RESTART_ATTEMPTS}" != "0" ] && [ "\$restart_attempt" -ge "$${ARG_MAX_RESTART_ATTEMPTS}" ]; then
+    echo "[\$ts] Reached max_restart_attempts ($${ARG_MAX_RESTART_ATTEMPTS}); giving up."
+    break
+  fi
+  restart_attempt=\$((restart_attempt + 1))
+  echo "[\$ts] Restarting t3 serve in $${ARG_RESTART_DELAY_SECONDS}s (attempt \$restart_attempt)..."
+  sleep $(printf '%q' "$${ARG_RESTART_DELAY_SECONDS}")
+done
+EOF_LAUNCHER
+
+chmod +x "$LAUNCHER_PATH"
+
+echo "🚀 Starting T3 Code server on port $${ARG_PORT}..."
+echo "ℹ️ First-time browser access requires pairing. Look below for a line starting with 'Pairing URL:' (or scan the printed QR code) the first time you open the app in a given browser."
+
+nohup "$LAUNCHER_PATH" >> "$LOG_PATH" 2>&1 &
+disown
+
+echo "T3 Code launcher started (pid $!). Logs: $LOG_PATH"
