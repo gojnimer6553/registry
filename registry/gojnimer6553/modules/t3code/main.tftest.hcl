@@ -41,8 +41,8 @@ run "defaults_are_correct" {
   }
 
   assert {
-    condition     = var.share == "public"
-    error_message = "Default share should be 'public'"
+    condition     = var.share == "owner"
+    error_message = "Default share should be 'owner'"
   }
 
   assert {
@@ -56,8 +56,8 @@ run "defaults_are_correct" {
   }
 
   assert {
-    condition     = resource.coder_app.t3code[0].url == "http://localhost:3773"
-    error_message = "App URL should point at localhost on the configured port"
+    condition     = resource.coder_app.t3code[0].url == "http://localhost:3774"
+    error_message = "App URL should point at the redirector on port+1 by default"
   }
 
   assert {
@@ -71,13 +71,13 @@ run "defaults_are_correct" {
   }
 
   assert {
-    condition     = var.external_url == ""
-    error_message = "external_url should default to empty"
+    condition     = local.redirector_port == 3774
+    error_message = "Default redirector_port should be port + 1"
   }
 
   assert {
-    condition     = var.pairing_ttl == "24h"
-    error_message = "Default pairing_ttl should be '24h'"
+    condition     = var.pairing_ttl == "5m"
+    error_message = "Default pairing_ttl should be '5m'"
   }
 }
 
@@ -90,13 +90,28 @@ run "custom_port_configuration" {
   }
 
   assert {
-    condition     = resource.coder_app.t3code[0].url == "http://localhost:4001"
-    error_message = "App URL should use the configured port"
+    condition     = resource.coder_app.t3code[0].url == "http://localhost:4002"
+    error_message = "App URL should use redirector_port (port + 1) by default"
   }
 
   assert {
-    condition     = [for h in resource.coder_app.t3code[0].healthcheck : h.url][0] == "http://localhost:4001/"
-    error_message = "Healthcheck URL should use the configured port"
+    condition     = [for h in resource.coder_app.t3code[0].healthcheck : h.url][0] == "http://localhost:4002/healthz"
+    error_message = "Healthcheck URL should target the redirector's /healthz"
+  }
+}
+
+run "custom_redirector_port_configuration" {
+  command = apply
+
+  variables {
+    agent_id        = "test-agent"
+    port            = 4001
+    redirector_port = 5001
+  }
+
+  assert {
+    condition     = resource.coder_app.t3code[0].url == "http://localhost:5001"
+    error_message = "App URL should use the explicit redirector_port override"
   }
 }
 
@@ -356,55 +371,16 @@ run "enable_app_false_omits_coder_app" {
   }
 }
 
-run "invalid_external_url_rejected" {
+run "custom_pairing_ttl_configuration" {
   command = plan
 
   variables {
-    agent_id     = "test-agent"
-    external_url = "not-a-url"
-  }
-
-  expect_failures = [
-    var.external_url,
-  ]
-}
-
-run "external_url_configuration" {
-  command = plan
-
-  variables {
-    agent_id     = "test-agent"
-    external_url = "https://t3code--myworkspace--me.coder.example.com"
-    pairing_ttl  = "30d"
+    agent_id    = "test-agent"
+    pairing_ttl = "1h"
   }
 
   assert {
-    condition     = var.external_url == "https://t3code--myworkspace--me.coder.example.com"
-    error_message = "external_url should be set correctly"
-  }
-
-  assert {
-    condition     = var.pairing_ttl == "30d"
+    condition     = var.pairing_ttl == "1h"
     error_message = "pairing_ttl should be set correctly"
-  }
-}
-
-run "headless_only_configuration" {
-  command = plan
-
-  variables {
-    agent_id     = "test-agent"
-    enable_app   = false
-    external_url = "https://t3code.tailnet-name.ts.net"
-  }
-
-  assert {
-    condition     = length(resource.coder_app.t3code) == 0
-    error_message = "No coder_app resource should be created when enable_app is false"
-  }
-
-  assert {
-    condition     = var.external_url == "https://t3code.tailnet-name.ts.net"
-    error_message = "external_url should still be usable when enable_app is false"
   }
 }

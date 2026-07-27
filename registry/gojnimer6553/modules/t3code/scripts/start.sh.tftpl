@@ -11,13 +11,16 @@ ARG_RESTART_ON_KILL='${ARG_RESTART_ON_KILL}'
 ARG_RESTART_DELAY_SECONDS='${ARG_RESTART_DELAY_SECONDS}'
 ARG_MAX_RESTART_ATTEMPTS='${ARG_MAX_RESTART_ATTEMPTS}'
 ARG_ADDITIONAL_ARGUMENTS=$(echo -n '${ARG_ADDITIONAL_ARGUMENTS}' | base64 -d)
-ARG_EXTERNAL_URL=$(echo -n '${ARG_EXTERNAL_URL}' | base64 -d)
+ARG_ENABLE_APP='${ARG_ENABLE_APP}'
+ARG_REDIRECTOR_PORT='${ARG_REDIRECTOR_PORT}'
 ARG_PAIRING_TTL='${ARG_PAIRING_TTL}'
 
 T3_BIN="$${ARG_INSTALL_PREFIX}/node_modules/.bin/t3"
 SCRIPTS_DIR="$${ARG_MODULE_DIRECTORY}/scripts"
 LOG_PATH="$${ARG_MODULE_DIRECTORY}/logs/start.log"
 LAUNCHER_PATH="$${SCRIPTS_DIR}/t3-launcher.sh"
+REDIRECTOR_PATH="$${SCRIPTS_DIR}/t3-redirector.js"
+REDIRECTOR_LOG_PATH="$${ARG_MODULE_DIRECTORY}/logs/redirector.log"
 
 if [ ! -x "$T3_BIN" ]; then
   echo "❌ t3 binary not found at $T3_BIN. Did the install script run and succeed?"
@@ -25,23 +28,6 @@ if [ ! -x "$T3_BIN" ]; then
 fi
 
 mkdir -p "$SCRIPTS_DIR" "$(dirname "$LOG_PATH")"
-
-# Mint an additional pairing link scoped to the public URL, before starting
-# the server, so this one-off CLI invocation (which operates directly on the
-# SQLite auth database) never races the server's own DB migrations. T3
-# Code's auto-issued startup pairing token only lasts 5 minutes, so this
-# gives a much longer-lived link for external/remote pairing.
-#
-# This writes to this script's own stdout/stderr (captured into LOG_PATH by
-# the coder-utils wrapper that invokes this script), not to LOG_PATH
-# directly: that wrapper's `tee` truncates LOG_PATH when its pipe opens, and
-# a direct write here can race that truncation and be silently wiped.
-if [ -n "$ARG_EXTERNAL_URL" ]; then
-  echo "🔗 Minting an external pairing link for $ARG_EXTERNAL_URL (ttl: $ARG_PAIRING_TTL)..."
-  if ! "$T3_BIN" auth pairing create --ttl "$ARG_PAIRING_TTL" --base-url "$ARG_EXTERNAL_URL" --label coder-external; then
-    echo "⚠️ Failed to mint an external pairing link; see the output above. The in-workspace app and its own startup pairing link are unaffected."
-  fi
-fi
 
 # Materialize a standalone launcher so the actual "t3 serve" process is a
 # detached grandchild of this coder_script, not a direct child of it. That
@@ -71,9 +57,160 @@ EOF_LAUNCHER
 chmod +x "$LAUNCHER_PATH"
 
 echo "🚀 Starting T3 Code server on port $${ARG_PORT}..."
-echo "ℹ️ First-time browser access requires pairing. Look below for a line starting with 'Pairing URL:' (or scan the printed QR code) the first time you open the app in a given browser."
 
 nohup "$LAUNCHER_PATH" >> "$LOG_PATH" 2>&1 &
 disown
 
 echo "T3 Code launcher started (pid $!). Logs: $LOG_PATH"
+
+if [ "$${ARG_ENABLE_APP}" != "true" ]; then
+  exit 0
+fi
+
+NODE_BIN="$(command -v node || true)"
+if [ -z "$NODE_BIN" ]; then
+  echo "⚠️ node not found on PATH; skipping the pairing proxy. The Coder app tile will show unhealthy until this is resolved (T3 Code itself is unaffected)."
+  exit 0
+fi
+
+# Reverse proxy in front of T3 Code, listening on ARG_REDIRECTOR_PORT (what
+# the coder_app's url actually points at). Opening "/" mints a fresh
+# one-time pairing link and redirects to it, so there's no token to copy by
+# hand; every other request -- including WebSocket upgrades, which T3 Code's
+# UI depends on -- is transparently forwarded to the real server on
+# ARG_PORT. Node-only (no dependencies): a Node runtime is already required
+# to run T3 Code itself.
+cat > "$REDIRECTOR_PATH" << 'EOF_REDIRECTOR'
+"use strict";
+const http = require("http");
+const net = require("net");
+const { execFileSync } = require("child_process");
+
+const T3_BIN = process.env.T3_BIN;
+const PAIRING_TTL = process.env.PAIRING_TTL;
+const BACKEND_HOST = "127.0.0.1";
+const BACKEND_PORT = process.env.T3_PORT;
+const LISTEN_PORT = parseInt(process.env.REDIRECTOR_PORT, 10);
+
+function mintPairingLinkAndRedirect(res) {
+  let token;
+  try {
+    const output = execFileSync(
+      T3_BIN,
+      ["auth", "pairing", "create", "--ttl", PAIRING_TTL, "--label", "coder-app", "--json"],
+      { encoding: "utf8" },
+    );
+    token = JSON.parse(output).credential;
+  } catch (err) {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end(
+      "Failed to mint a T3 Code pairing token: " +
+        (err && err.message ? err.message : String(err)),
+    );
+    return;
+  }
+  // Document-relative (no leading slash): resolves against the current
+  // request's own URL, so this works whether the app is reached via its own
+  // subdomain or via a path-based Coder proxy URL, without needing to know
+  // the externally-visible origin.
+  res.writeHead(302, { Location: "pair#token=" + token });
+  res.end();
+}
+
+function checkUpstreamHealth(res) {
+  const check = http.get(
+    { host: BACKEND_HOST, port: BACKEND_PORT, path: "/", timeout: 2000 },
+    (upstreamRes) => {
+      upstreamRes.resume();
+      const ok = upstreamRes.statusCode === 200;
+      res.writeHead(ok ? 200 : 502, { "Content-Type": "text/plain" });
+      res.end(ok ? "ok" : "upstream unhealthy");
+    },
+  );
+  check.on("timeout", () => {
+    check.destroy();
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("upstream timeout");
+  });
+  check.on("error", () => {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("upstream unreachable");
+  });
+}
+
+function proxyRequest(req, res) {
+  const proxyReq = http.request(
+    {
+      host: BACKEND_HOST,
+      port: BACKEND_PORT,
+      path: req.url,
+      method: req.method,
+      headers: req.headers,
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res, { end: true });
+    },
+  );
+  proxyReq.on("error", () => {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+    }
+    res.end("Upstream T3 Code server is unreachable.");
+  });
+  req.pipe(proxyReq, { end: true });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/healthz") {
+    checkUpstreamHealth(res);
+    return;
+  }
+  if (req.method === "GET" && req.url === "/") {
+    mintPairingLinkAndRedirect(res);
+    return;
+  }
+  proxyRequest(req, res);
+});
+
+// Raw passthrough for WebSocket upgrades (T3 Code's UI is WS-backed): hand
+// crafts the upstream request line/headers on a plain TCP socket, then pipes
+// both directions. There is no HTTP response to intercept here, so this
+// can't distinguish "/" from other paths the way proxyRequest does -- but
+// the browser only ever upgrades a path it already loaded through a normal
+// GET first, never "/" itself.
+server.on("upgrade", (req, clientSocket, head) => {
+  const backendSocket = net.connect(BACKEND_PORT, BACKEND_HOST, () => {
+    const lines = [req.method + " " + req.url + " HTTP/1.1"];
+    for (const key of Object.keys(req.headers)) {
+      const value = req.headers[key];
+      if (Array.isArray(value)) {
+        for (const v of value) lines.push(key + ": " + v);
+      } else {
+        lines.push(key + ": " + value);
+      }
+    }
+    lines.push("", "");
+    backendSocket.write(lines.join("\r\n"));
+    if (head && head.length) backendSocket.write(head);
+    backendSocket.pipe(clientSocket);
+    clientSocket.pipe(backendSocket);
+  });
+  backendSocket.on("error", () => clientSocket.destroy());
+  clientSocket.on("error", () => backendSocket.destroy());
+});
+
+server.listen(LISTEN_PORT, "127.0.0.1");
+EOF_REDIRECTOR
+
+echo "🔁 Starting T3 Code pairing proxy on port $${ARG_REDIRECTOR_PORT} (in front of $${ARG_PORT})..."
+
+nohup env \
+  T3_BIN="$T3_BIN" \
+  T3_PORT="$${ARG_PORT}" \
+  REDIRECTOR_PORT="$${ARG_REDIRECTOR_PORT}" \
+  PAIRING_TTL="$${ARG_PAIRING_TTL}" \
+  "$NODE_BIN" "$REDIRECTOR_PATH" >> "$REDIRECTOR_LOG_PATH" 2>&1 &
+disown
+
+echo "T3 Code pairing proxy started (pid $!). Logs: $REDIRECTOR_LOG_PATH"

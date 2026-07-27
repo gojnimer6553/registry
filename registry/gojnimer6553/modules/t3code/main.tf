@@ -125,8 +125,8 @@ variable "max_restart_attempts" {
 
 variable "share" {
   type        = string
-  description = "Determines visibility of the app. Must be one of 'owner', 'authenticated', or 'public'. Defaults to 'public' since T3 Code gates all real access behind its own pairing-token/session system regardless of this setting -- see 'Remote / external access' in the README."
-  default     = "public"
+  description = "Determines visibility of the app. Must be one of 'owner', 'authenticated', or 'public'."
+  default     = "owner"
 
   validation {
     condition     = contains(["owner", "authenticated", "public"], var.share)
@@ -184,31 +184,27 @@ variable "post_install_script" {
 
 variable "enable_app" {
   type        = bool
-  description = "Whether to create the Coder app (dashboard tile) for T3 Code. Set to false for a headless-only setup where T3 Code is reached exclusively through external_url/remote access."
+  description = "Whether to create the Coder app (dashboard tile) for T3 Code, and run the local proxy it depends on. Set to false for a headless-only setup with no dashboard tile at all."
   default     = true
 }
 
-variable "external_url" {
-  type        = string
-  description = "Publicly reachable base URL for this T3 Code instance (for example, the coder_app's own public URL when share is \"public\"). When set, T3 Code mints an additional pairing link scoped to this URL on every start (see pairing_ttl) so you can pair a browser or the T3 desktop app directly, without going through the Coder dashboard. Leave empty to skip this."
-  default     = ""
-
-  validation {
-    condition     = var.external_url == "" || can(regex("^https?://", var.external_url))
-    error_message = "The 'external_url' variable must be empty or start with http:// or https://."
-  }
+variable "redirector_port" {
+  type        = number
+  description = "Port for the local reverse proxy that sits in front of T3 Code. The coder_app's url points here rather than directly at `port`: opening the app for the first time mints a fresh one-time pairing link and redirects to it, so there's no manual token to copy; every other request is transparently proxied through to the real T3 Code server, including WebSocket upgrades. Defaults to `port + 1`."
+  default     = null
 }
 
 variable "pairing_ttl" {
   type        = string
-  description = "TTL for the pairing link minted against external_url (for example: `1h`, `24h`, `30d`). T3 Code's own auto-issued startup pairing token only lasts 5 minutes; this gives you a longer window to actually use the link. Only relevant when external_url is set."
-  default     = "24h"
+  description = "TTL for each pairing link the local proxy mints when the app is opened (for example: `1m`, `5m`, `1h`). Each link is used immediately by the browser, so this only needs to be long enough to cover the redirect itself."
+  default     = "5m"
 }
 
 locals {
   module_dir_name  = ".coder-modules/gojnimer6553/t3code"
   module_directory = "$HOME/${local.module_dir_name}"
   install_prefix   = coalesce(var.install_prefix, "$HOME/${local.module_dir_name}/npm")
+  redirector_port  = coalesce(var.redirector_port, var.port + 1)
 
   install_script = templatefile("${path.module}/scripts/install.sh.tftpl", {
     ARG_INSTALL         = tostring(var.install)
@@ -228,7 +224,8 @@ locals {
     ARG_RESTART_DELAY_SECONDS = tostring(var.restart_delay_seconds)
     ARG_MAX_RESTART_ATTEMPTS  = tostring(var.max_restart_attempts)
     ARG_ADDITIONAL_ARGUMENTS  = base64encode(var.additional_arguments)
-    ARG_EXTERNAL_URL          = base64encode(var.external_url)
+    ARG_ENABLE_APP            = tostring(var.enable_app)
+    ARG_REDIRECTOR_PORT       = tostring(local.redirector_port)
     ARG_PAIRING_TTL           = var.pairing_ttl
   })
 }
@@ -252,7 +249,7 @@ resource "coder_app" "t3code" {
   agent_id     = var.agent_id
   slug         = var.slug
   display_name = var.display_name
-  url          = "http://localhost:${var.port}"
+  url          = "http://localhost:${local.redirector_port}"
   icon         = var.icon
   subdomain    = var.subdomain
   share        = var.share
@@ -261,7 +258,7 @@ resource "coder_app" "t3code" {
   open_in      = var.open_in
 
   healthcheck {
-    url       = "http://localhost:${var.port}/"
+    url       = "http://localhost:${local.redirector_port}/healthz"
     interval  = 5
     threshold = 6
   }

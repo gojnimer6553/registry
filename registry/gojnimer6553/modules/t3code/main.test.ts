@@ -166,6 +166,23 @@ describe("t3code", async () => {
       expect(log).toContain("Connection string:");
       expect(log).toContain("Token:");
       expect(log).toMatch(/Pairing URL: http:\/\/.+\/pair#token=/);
+
+      // The pairing proxy fronting this real server: default
+      // redirector_port is port + 1 (3774 here).
+      const health = await httpGetInContainer(id, 3774, "/healthz");
+      expect(health.status).toBe(200);
+      expect(health.body).toBe("ok");
+
+      const root = await httpGetInContainer(id, 3774, "/");
+      expect(root.status).toBe(302);
+      expect(root.location).toMatch(/^pair#token=.+/);
+
+      // A real browser strips the fragment before sending the request, so
+      // this hits the same static SPA shell "/pair" serves for any route --
+      // confirms the proxy forwards non-root paths to the real server too.
+      const pairPage = await httpGetInContainer(id, 3774, "/pair");
+      expect(pairPage.status).toBe(200);
+      expect(pairPage.body.toLowerCase()).toContain("<html");
     } finally {
       await removeContainer(id);
     }
@@ -338,108 +355,230 @@ describe("t3code", async () => {
     }
   }, 60000);
 
-  it("mints an external pairing link when external_url is set", async () => {
+  // Fake t3 binary whose "serve" subcommand runs a trivial upstream HTTP
+  // server (so the redirector's proxy passthrough has something real to
+  // forward to) and whose "auth pairing create --json" prints a fake
+  // credential (so the redirector's mint-and-redirect path is exercised
+  // without a real T3 Code install).
+  const fakeT3WithUpstreamServer = [
+    "#!/bin/bash",
+    'case "$1" in',
+    "  serve)",
+    "    shift",
+    '    port=""',
+    '    while [ "$#" -gt 0 ]; do',
+    '      if [ "$1" = "--port" ]; then port="$2"; fi',
+    "      shift",
+    "    done",
+    "    exec node -e '",
+    '      const http = require("http");',
+    '      const crypto = require("crypto");',
+    "      const port = parseInt(process.argv[1], 10);",
+    "      const server = http.createServer((req, res) => {",
+    '        res.writeHead(200, { "Content-Type": "text/plain" });',
+    '        res.end("upstream:" + req.url);',
+    "      });",
+    '      server.on("upgrade", (req, socket) => {',
+    '        const key = req.headers["sec-websocket-key"];',
+    "        const accept = crypto",
+    '          .createHash("sha1")',
+    '          .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")',
+    '          .digest("base64");',
+    "        socket.write(",
+    '          "HTTP/1.1 101 Switching Protocols\\r\\n" +',
+    '            "Upgrade: websocket\\r\\n" +',
+    '            "Connection: Upgrade\\r\\n" +',
+    '            "Sec-WebSocket-Accept: " + accept + "\\r\\n\\r\\n",',
+    "        );",
+    "        // Not real WS framing -- just raw-echoes bytes, to prove the",
+    "        // proxy relays the upgraded socket in both directions.",
+    '        socket.on("data", (chunk) => socket.write(chunk));',
+    "      });",
+    '      server.listen(port, "127.0.0.1");',
+    '    \' -- "$port"',
+    "    ;;",
+    "  auth)",
+    '    echo \'{"id":"fake-id","credential":"FAKETOKEN123","scopes":[],"expiresAt":"2099-01-01T00:00:00.000Z"}\'',
+    "    ;;",
+    "esac",
+  ].join("\n");
+
+  // Issues one HTTP GET from inside the container (no curl dependency: the
+  // test image only guarantees node) and reports status/location/body.
+  const httpGetInContainer = async (
+    id: string,
+    port: number,
+    path: string,
+  ): Promise<{ status: number; location: string; body: string }> => {
+    const script = [
+      'const http = require("http");',
+      `const req = http.get({ host: "127.0.0.1", port: ${port}, path: ${JSON.stringify(path)} }, (res) => {`,
+      '  let body = "";',
+      '  res.on("data", (c) => (body += c));',
+      '  res.on("end", () => {',
+      '    console.log("STATUS:" + res.statusCode);',
+      '    console.log("LOCATION:" + (res.headers.location || ""));',
+      '    console.log("BODY:" + body);',
+      "    process.exit(0);",
+      "  });",
+      "});",
+      'req.on("error", (e) => { console.log("ERROR:" + e.message); process.exit(1); });',
+    ].join("\n");
+    const output = await execContainer(id, ["node", "-e", script]);
+    const status = Number(/STATUS:(\d+)/.exec(output.stdout)?.[1] ?? "0");
+    const location = /LOCATION:(.*)/.exec(output.stdout)?.[1] ?? "";
+    const body = /BODY:([\s\S]*)/.exec(output.stdout)?.[1]?.trim() ?? "";
+    return { status, location, body };
+  };
+
+  // Polls "/healthz" until it returns 200. For the redirector this proves
+  // both the redirector itself and the real upstream behind it are ready;
+  // the fake upstream server used directly (enable_app=false case) answers
+  // 200 on every path regardless, so this works there too.
+  const waitForPort = async (
+    id: string,
+    port: number,
+    timeoutMs = 30000,
+  ): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const { status } = await httpGetInContainer(id, port, "/healthz");
+      if (status === 200) return;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error(`Timed out waiting for port ${port} to accept connections`);
+  };
+
+  it("mints a pairing token and redirects when the app is opened, and proxies other paths through to T3 Code", async () => {
     const state = await runTerraformApply(import.meta.dir, {
       agent_id: "foo",
       install: false,
       port: 4004,
-      external_url: "https://t3code.example.test",
-      pairing_ttl: "1h",
+      redirector_port: 4104,
     });
     const { install, start } = collectScripts(state);
 
-    const id = await runContainer("alpine/curl");
+    const id = await runContainer("node:22-bookworm-slim");
     try {
-      await writeCoder(id, "#!/bin/sh\nexit 0\n");
-      await execContainer(id, ["sh", "-c", "apk add --no-cache bash"]);
+      await writeCoder(id, "#!/bin/bash\nexit 0\n");
       await execContainer(id, ["bash", "-c", install]);
-      await installFakeT3Binary(
-        id,
-        [
-          "#!/bin/bash",
-          'case "$1" in',
-          "  serve)",
-          "    shift",
-          "    i=1",
-          '    for arg in "$@"; do',
-          '      echo "arg$i=$arg"',
-          "      i=$((i + 1))",
-          "    done",
-          "    ;;",
-          "  auth)",
-          '    base_url=""',
-          '    while [ "$#" -gt 0 ]; do',
-          '      if [ "$1" = "--base-url" ]; then',
-          '        base_url="$2"',
-          "      fi",
-          "      shift",
-          "    done",
-          '    echo "Issued client pairing token fake-id."',
-          '    echo "Token: FAKE123"',
-          '    echo "Pair URL: ${base_url}/pair#token=FAKE123"',
-          '    echo "Expires at: 2099-01-01T00:00:00.000Z"',
-          "    ;;",
-          "esac",
-        ].join("\n"),
-      );
+      await installFakeT3Binary(id, fakeT3WithUpstreamServer);
 
       const output = await execContainer(id, ["bash", "-c", start]);
       expect(output.exitCode).toBe(0);
 
-      const log = await waitForLogContains(
-        id,
-        START_LOG_PATH,
-        "Pair URL:",
-        30000,
-      );
-      expect(log).toContain(
-        "Minting an external pairing link for https://t3code.example.test (ttl: 1h)...",
-      );
-      expect(log).toContain(
-        "Pair URL: https://t3code.example.test/pair#token=FAKE123",
-      );
-      // The external mint must complete before the server starts (see
-      // start.sh.tftpl comment on avoiding a DB migration race), so its
-      // output should appear earlier in the log than the launcher message.
-      expect(log.indexOf("Pair URL:")).toBeLessThan(
-        log.indexOf("T3 Code launcher started"),
-      );
+      await waitForPort(id, 4104);
+
+      const root = await httpGetInContainer(id, 4104, "/");
+      expect(root.status).toBe(302);
+      expect(root.location).toBe("pair#token=FAKETOKEN123");
+
+      const proxied = await httpGetInContainer(id, 4104, "/some/path?x=1");
+      expect(proxied.status).toBe(200);
+      expect(proxied.body).toBe("upstream:/some/path?x=1");
+
+      const health = await httpGetInContainer(id, 4104, "/healthz");
+      expect(health.status).toBe(200);
+      expect(health.body).toBe("ok");
     } finally {
       await removeContainer(id);
     }
   }, 60000);
 
-  it("does not attempt to mint an external pairing link by default", async () => {
+  it("passes WebSocket upgrades through to T3 Code", async () => {
+    const state = await runTerraformApply(import.meta.dir, {
+      agent_id: "foo",
+      install: false,
+      port: 4006,
+      redirector_port: 4106,
+    });
+    const { install, start } = collectScripts(state);
+
+    const id = await runContainer("node:22-bookworm-slim");
+    try {
+      await writeCoder(id, "#!/bin/bash\nexit 0\n");
+      await execContainer(id, ["bash", "-c", install]);
+      await installFakeT3Binary(id, fakeT3WithUpstreamServer);
+
+      const output = await execContainer(id, ["bash", "-c", start]);
+      expect(output.exitCode).toBe(0);
+      await waitForPort(id, 4106);
+
+      // The well-known key/accept pair from RFC 6455 section 1.3, so the
+      // expected Sec-WebSocket-Accept value can be hardcoded here instead
+      // of computed, keeping the in-container client script trivial.
+      const wsKey = "dGhlIHNhbXBsZSBub25jZQ==";
+      const expectedAccept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+      const script = [
+        'const net = require("net");',
+        `const socket = net.connect(4106, "127.0.0.1", () => {`,
+        "  socket.write(",
+        '    ["GET /ws HTTP/1.1", "Host: localhost", "Connection: Upgrade", "Upgrade: websocket",',
+        `      "Sec-WebSocket-Key: ${wsKey}", "Sec-WebSocket-Version: 13", "", ""].join("\\r\\n"),`,
+        "  );",
+        "});",
+        "let buf = Buffer.alloc(0);",
+        "let handshakeDone = false;",
+        'socket.on("data", (chunk) => {',
+        "  buf = Buffer.concat([buf, chunk]);",
+        "  if (!handshakeDone) {",
+        '    const text = buf.toString("utf8");',
+        '    const idx = text.indexOf("\\r\\n\\r\\n");',
+        "    if (idx === -1) return;",
+        "    handshakeDone = true;",
+        "    const headerText = text.slice(0, idx);",
+        '    console.log("STATUS_LINE:" + headerText.split("\\r\\n")[0]);',
+        "    const acceptMatch = /Sec-WebSocket-Accept:\\s*(.+)/i.exec(headerText);",
+        '    console.log("ACCEPT:" + (acceptMatch ? acceptMatch[1].trim() : ""));',
+        '    socket.write("hello-through-proxy");',
+        "  } else {",
+        '    console.log("ECHO:" + chunk.toString("utf8"));',
+        "    socket.end();",
+        "    process.exit(0);",
+        "  }",
+        "});",
+        'socket.on("error", (e) => { console.log("ERROR:" + e.message); process.exit(1); });',
+        'setTimeout(() => { console.log("TIMEOUT"); process.exit(1); }, 5000);',
+      ].join("\n");
+
+      const result = await execContainer(id, ["node", "-e", script]);
+      expect(result.stdout).toContain("STATUS_LINE:HTTP/1.1 101");
+      expect(result.stdout).toContain("ACCEPT:" + expectedAccept);
+      expect(result.stdout).toContain("ECHO:hello-through-proxy");
+    } finally {
+      await removeContainer(id);
+    }
+  }, 60000);
+
+  it("does not start the pairing proxy when enable_app is false", async () => {
     const state = await runTerraformApply(import.meta.dir, {
       agent_id: "foo",
       install: false,
       port: 4005,
+      redirector_port: 4105,
+      enable_app: false,
     });
     const { install, start } = collectScripts(state);
 
-    const id = await runContainer("alpine/curl");
+    const id = await runContainer("node:22-bookworm-slim");
     try {
-      await writeCoder(id, "#!/bin/sh\nexit 0\n");
-      await execContainer(id, ["sh", "-c", "apk add --no-cache bash"]);
+      await writeCoder(id, "#!/bin/bash\nexit 0\n");
       await execContainer(id, ["bash", "-c", install]);
-      await installFakeT3Binary(
-        id,
-        [
-          "#!/bin/bash",
-          'case "$1" in',
-          "  serve) echo serve-called ;;",
-          "  auth) echo auth-called ;;",
-          "esac",
-        ].join("\n"),
-      );
+      await installFakeT3Binary(id, fakeT3WithUpstreamServer);
 
       const output = await execContainer(id, ["bash", "-c", start]);
       expect(output.exitCode).toBe(0);
+      expect(output.stdout).not.toContain("pairing proxy");
 
-      await waitForLogContains(id, START_LOG_PATH, "launcher started", 30000);
-      const log = await readFileContainer(id, START_LOG_PATH);
-      expect(log).not.toContain("auth-called");
-      expect(log).not.toContain("Minting an external pairing link");
+      // The main server itself still starts and is reachable directly.
+      await waitForPort(id, 4005);
+      const direct = await httpGetInContainer(id, 4005, "/direct");
+      expect(direct.status).toBe(200);
+      expect(direct.body).toBe("upstream:/direct");
+
+      // Nothing should ever come up on the (unused) redirector port.
+      const redirector = await httpGetInContainer(id, 4105, "/");
+      expect(redirector.status).toBe(0);
     } finally {
       await removeContainer(id);
     }
