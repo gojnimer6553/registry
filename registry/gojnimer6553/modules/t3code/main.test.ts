@@ -337,4 +337,111 @@ describe("t3code", async () => {
       await removeContainer(id);
     }
   }, 60000);
+
+  it("mints an external pairing link when external_url is set", async () => {
+    const state = await runTerraformApply(import.meta.dir, {
+      agent_id: "foo",
+      install: false,
+      port: 4004,
+      external_url: "https://t3code.example.test",
+      pairing_ttl: "1h",
+    });
+    const { install, start } = collectScripts(state);
+
+    const id = await runContainer("alpine/curl");
+    try {
+      await writeCoder(id, "#!/bin/sh\nexit 0\n");
+      await execContainer(id, ["sh", "-c", "apk add --no-cache bash"]);
+      await execContainer(id, ["bash", "-c", install]);
+      await installFakeT3Binary(
+        id,
+        [
+          "#!/bin/bash",
+          'case "$1" in',
+          "  serve)",
+          "    shift",
+          "    i=1",
+          '    for arg in "$@"; do',
+          '      echo "arg$i=$arg"',
+          "      i=$((i + 1))",
+          "    done",
+          "    ;;",
+          "  auth)",
+          '    base_url=""',
+          '    while [ "$#" -gt 0 ]; do',
+          '      if [ "$1" = "--base-url" ]; then',
+          '        base_url="$2"',
+          "      fi",
+          "      shift",
+          "    done",
+          '    echo "Issued client pairing token fake-id."',
+          '    echo "Token: FAKE123"',
+          '    echo "Pair URL: ${base_url}/pair#token=FAKE123"',
+          '    echo "Expires at: 2099-01-01T00:00:00.000Z"',
+          "    ;;",
+          "esac",
+        ].join("\n"),
+      );
+
+      const output = await execContainer(id, ["bash", "-c", start]);
+      expect(output.exitCode).toBe(0);
+
+      const log = await waitForLogContains(
+        id,
+        START_LOG_PATH,
+        "Pair URL:",
+        30000,
+      );
+      expect(log).toContain(
+        "Minting an external pairing link for https://t3code.example.test (ttl: 1h)...",
+      );
+      expect(log).toContain(
+        "Pair URL: https://t3code.example.test/pair#token=FAKE123",
+      );
+      // The external mint must complete before the server starts (see
+      // start.sh.tftpl comment on avoiding a DB migration race), so its
+      // output should appear earlier in the log than the launcher message.
+      expect(log.indexOf("Pair URL:")).toBeLessThan(
+        log.indexOf("T3 Code launcher started"),
+      );
+    } finally {
+      await removeContainer(id);
+    }
+  }, 60000);
+
+  it("does not attempt to mint an external pairing link by default", async () => {
+    const state = await runTerraformApply(import.meta.dir, {
+      agent_id: "foo",
+      install: false,
+      port: 4005,
+    });
+    const { install, start } = collectScripts(state);
+
+    const id = await runContainer("alpine/curl");
+    try {
+      await writeCoder(id, "#!/bin/sh\nexit 0\n");
+      await execContainer(id, ["sh", "-c", "apk add --no-cache bash"]);
+      await execContainer(id, ["bash", "-c", install]);
+      await installFakeT3Binary(
+        id,
+        [
+          "#!/bin/bash",
+          'case "$1" in',
+          "  serve) echo serve-called ;;",
+          "  auth) echo auth-called ;;",
+          "esac",
+        ].join("\n"),
+      );
+
+      const output = await execContainer(id, ["bash", "-c", start]);
+      expect(output.exitCode).toBe(0);
+
+      await waitForLogContains(id, START_LOG_PATH, "launcher started", 30000);
+      const log = await readFileContainer(id, START_LOG_PATH);
+      expect(log).not.toContain("auth-called");
+      expect(log).not.toContain("Minting an external pairing link");
+    } finally {
+      await removeContainer(id);
+    }
+  }, 60000);
 });

@@ -11,6 +11,8 @@ ARG_RESTART_ON_KILL='${ARG_RESTART_ON_KILL}'
 ARG_RESTART_DELAY_SECONDS='${ARG_RESTART_DELAY_SECONDS}'
 ARG_MAX_RESTART_ATTEMPTS='${ARG_MAX_RESTART_ATTEMPTS}'
 ARG_ADDITIONAL_ARGUMENTS=$(echo -n '${ARG_ADDITIONAL_ARGUMENTS}' | base64 -d)
+ARG_EXTERNAL_URL=$(echo -n '${ARG_EXTERNAL_URL}' | base64 -d)
+ARG_PAIRING_TTL='${ARG_PAIRING_TTL}'
 
 T3_BIN="$${ARG_INSTALL_PREFIX}/node_modules/.bin/t3"
 SCRIPTS_DIR="$${ARG_MODULE_DIRECTORY}/scripts"
@@ -23,6 +25,23 @@ if [ ! -x "$T3_BIN" ]; then
 fi
 
 mkdir -p "$SCRIPTS_DIR" "$(dirname "$LOG_PATH")"
+
+# Mint an additional pairing link scoped to the public URL, before starting
+# the server, so this one-off CLI invocation (which operates directly on the
+# SQLite auth database) never races the server's own DB migrations. T3
+# Code's auto-issued startup pairing token only lasts 5 minutes, so this
+# gives a much longer-lived link for external/remote pairing.
+#
+# This writes to this script's own stdout/stderr (captured into LOG_PATH by
+# the coder-utils wrapper that invokes this script), not to LOG_PATH
+# directly: that wrapper's `tee` truncates LOG_PATH when its pipe opens, and
+# a direct write here can race that truncation and be silently wiped.
+if [ -n "$ARG_EXTERNAL_URL" ]; then
+  echo "🔗 Minting an external pairing link for $ARG_EXTERNAL_URL (ttl: $ARG_PAIRING_TTL)..."
+  if ! "$T3_BIN" auth pairing create --ttl "$ARG_PAIRING_TTL" --base-url "$ARG_EXTERNAL_URL" --label coder-external; then
+    echo "⚠️ Failed to mint an external pairing link; see the output above. The in-workspace app and its own startup pairing link are unaffected."
+  fi
+fi
 
 # Materialize a standalone launcher so the actual "t3 serve" process is a
 # detached grandchild of this coder_script, not a direct child of it. That

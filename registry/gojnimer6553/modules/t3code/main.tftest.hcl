@@ -41,8 +41,8 @@ run "defaults_are_correct" {
   }
 
   assert {
-    condition     = var.share == "owner"
-    error_message = "Default share should be 'owner'"
+    condition     = var.share == "public"
+    error_message = "Default share should be 'public'"
   }
 
   assert {
@@ -56,13 +56,28 @@ run "defaults_are_correct" {
   }
 
   assert {
-    condition     = resource.coder_app.t3code.url == "http://localhost:3773"
+    condition     = resource.coder_app.t3code[0].url == "http://localhost:3773"
     error_message = "App URL should point at localhost on the configured port"
   }
 
   assert {
-    condition     = resource.coder_app.t3code.slug == "t3code"
+    condition     = resource.coder_app.t3code[0].slug == "t3code"
     error_message = "Default slug should be 't3code'"
+  }
+
+  assert {
+    condition     = var.enable_app == true
+    error_message = "enable_app should default to true"
+  }
+
+  assert {
+    condition     = var.external_url == ""
+    error_message = "external_url should default to empty"
+  }
+
+  assert {
+    condition     = var.pairing_ttl == "24h"
+    error_message = "Default pairing_ttl should be '24h'"
   }
 }
 
@@ -75,12 +90,12 @@ run "custom_port_configuration" {
   }
 
   assert {
-    condition     = resource.coder_app.t3code.url == "http://localhost:4001"
+    condition     = resource.coder_app.t3code[0].url == "http://localhost:4001"
     error_message = "App URL should use the configured port"
   }
 
   assert {
-    condition     = [for h in resource.coder_app.t3code.healthcheck : h.url][0] == "http://localhost:4001/"
+    condition     = [for h in resource.coder_app.t3code[0].healthcheck : h.url][0] == "http://localhost:4001/"
     error_message = "Healthcheck URL should use the configured port"
   }
 }
@@ -213,7 +228,7 @@ run "subdomain_disabled_configuration" {
   }
 
   assert {
-    condition     = resource.coder_app.t3code.subdomain == false
+    condition     = resource.coder_app.t3code[0].subdomain == false
     error_message = "subdomain should be disabled when specified"
   }
 }
@@ -231,27 +246,27 @@ run "custom_display_and_slug" {
   }
 
   assert {
-    condition     = resource.coder_app.t3code.slug == "t3"
+    condition     = resource.coder_app.t3code[0].slug == "t3"
     error_message = "Custom slug should be set"
   }
 
   assert {
-    condition     = resource.coder_app.t3code.display_name == "T3"
+    condition     = resource.coder_app.t3code[0].display_name == "T3"
     error_message = "Custom display_name should be set"
   }
 
   assert {
-    condition     = resource.coder_app.t3code.icon == "/custom/icon.svg"
+    condition     = resource.coder_app.t3code[0].icon == "/custom/icon.svg"
     error_message = "Custom icon should be set"
   }
 
   assert {
-    condition     = resource.coder_app.t3code.order == 5
+    condition     = resource.coder_app.t3code[0].order == 5
     error_message = "Custom order should be set"
   }
 
   assert {
-    condition     = resource.coder_app.t3code.group == "AI Tools"
+    condition     = resource.coder_app.t3code[0].group == "AI Tools"
     error_message = "Custom group should be set"
   }
 }
@@ -324,5 +339,72 @@ run "scripts_output_is_populated" {
   assert {
     condition     = length(output.scripts) > 0
     error_message = "scripts output should list at least the install and start scripts"
+  }
+}
+
+run "enable_app_false_omits_coder_app" {
+  command = plan
+
+  variables {
+    agent_id   = "test-agent"
+    enable_app = false
+  }
+
+  assert {
+    condition     = length(resource.coder_app.t3code) == 0
+    error_message = "No coder_app resource should be created when enable_app is false"
+  }
+}
+
+run "invalid_external_url_rejected" {
+  command = plan
+
+  variables {
+    agent_id     = "test-agent"
+    external_url = "not-a-url"
+  }
+
+  expect_failures = [
+    var.external_url,
+  ]
+}
+
+run "external_url_configuration" {
+  command = plan
+
+  variables {
+    agent_id     = "test-agent"
+    external_url = "https://t3code--myworkspace--me.coder.example.com"
+    pairing_ttl  = "30d"
+  }
+
+  assert {
+    condition     = var.external_url == "https://t3code--myworkspace--me.coder.example.com"
+    error_message = "external_url should be set correctly"
+  }
+
+  assert {
+    condition     = var.pairing_ttl == "30d"
+    error_message = "pairing_ttl should be set correctly"
+  }
+}
+
+run "headless_only_configuration" {
+  command = plan
+
+  variables {
+    agent_id     = "test-agent"
+    enable_app   = false
+    external_url = "https://t3code.tailnet-name.ts.net"
+  }
+
+  assert {
+    condition     = length(resource.coder_app.t3code) == 0
+    error_message = "No coder_app resource should be created when enable_app is false"
+  }
+
+  assert {
+    condition     = var.external_url == "https://t3code.tailnet-name.ts.net"
+    error_message = "external_url should still be usable when enable_app is false"
   }
 }
